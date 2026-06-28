@@ -1,0 +1,36 @@
+{
+  "name": "kopia-desk",
+  "version": "0.1.0",
+  "description": "Kopia Desk - backup simple",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder"
+  },
+  "build": {
+    "appId": "com.pachanga.kopia",
+    "productName": "Kopia Desk",
+    "asar": true,
+    "files": [
+      "**/*"
+    ],
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false
+    }
+  },
+  "devDependencies": {
+    "electron": "^26.0.0",
+    "electron-builder": "^24.0.0"
+  },
+  "dependencies": {
+    "drivelist": "^9.0.0"
+  }
+}

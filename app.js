@@ -30,6 +30,8 @@ const els = {
 const supportsFileSystem = typeof window.showDirectoryPicker === "function";
 els.supportWarning.hidden = supportsFileSystem;
 
+const isElectron = typeof window.kopiaApi !== "undefined";
+
 function log(message) {
   const item = document.createElement("li");
   item.textContent = `${new Date().toLocaleTimeString()} - ${message}`;
@@ -71,7 +73,13 @@ function readManifest(sourceName) {
 }
 
 function saveManifest(sourceName, manifest) {
-  localStorage.setItem(manifestKey(sourceName), JSON.stringify(manifest));
+  // sanitize manifest before saving: remove fullPath
+  const safe = {};
+  for (const [k, v] of Object.entries(manifest)) {
+    safe[k] = { name: v.name, path: v.path, size: v.size, lastModified: v.lastModified };
+    if (v.hash) safe[k].hash = v.hash;
+  }
+  localStorage.setItem(manifestKey(sourceName), JSON.stringify(safe));
 }
 
 function renderSources() {
@@ -105,6 +113,22 @@ function renderSources() {
 }
 
 async function addSource() {
+  if (isElectron) {
+    const paths = await window.kopiaApi.selectDirectory({ multi: true });
+    if (!paths) return;
+    paths.forEach(p => {
+      const name = p.split(/[/\\]/).pop();
+      if (state.sources.some(s => s.path === p)) {
+        log(`La carpeta ${name} ya estaba seleccionada.`);
+        return;
+      }
+      state.sources.push({ name, path: p, handle: null });
+    });
+    renderSources();
+    log(`Carpeta(s) añadida(s)`);
+    return;
+  }
+
   if (!supportsFileSystem) return;
   const handle = await window.showDirectoryPicker({ mode: "read" });
   if (state.sources.some((source) => source.name === handle.name)) {
@@ -117,6 +141,17 @@ async function addSource() {
 }
 
 async function pickDestination() {
+  if (isElectron) {
+    const paths = await window.kopiaApi.selectDirectory({ multi: false });
+    if (!paths) return;
+    const p = paths[0];
+    state.destination = { name: p.split(/[/\\]/).pop(), path: p, handle: null };
+    els.destinationLabel.textContent = state.destination.name;
+    log(`Destino elegido: ${state.destination.name}`);
+    updateCounts();
+    return;
+  }
+
   if (!supportsFileSystem) return;
   const handle = await window.showDirectoryPicker({ mode: "readwrite" });
   state.destination = { name: handle.name, handle };
@@ -126,6 +161,7 @@ async function pickDestination() {
 }
 
 async function scanDirectory(handle, basePath = "") {
+  // browser-only fallback (File System Access API)
   const files = {};
   for await (const [name, child] of handle.entries()) {
     const relativePath = basePath ? `${basePath}/${name}` : name;
@@ -191,12 +227,18 @@ async function scanAll() {
 
   for (const source of state.sources) {
     log(`Escaneando ${source.name}...`);
-    const current = await scanDirectory(source.handle);
+    let current = {};
+    if (isElectron && source.path) {
+      current = await window.kopiaApi.scanDirectory(source.path, { hash: els.hashToggle.checked });
+    } else if (source.handle) {
+      current = await scanDirectory(source.handle);
+    }
     const previous = readManifest(source.name);
     const diff = compareManifests(current, previous);
     state.comparisons.push({
       sourceName: source.name,
-      handle: source.handle,
+      handle: source.handle || null,
+      path: source.path || null,
       manifest: current,
       previousManifest: previous,
       ...diff,
@@ -284,6 +326,7 @@ function fileGroup(title, files, hint) {
 }
 
 async function getOrCreateDirectory(root, parts) {
+  // browser-only helper kept for compatibility. In Electron we use paths.
   let cursor = root;
   for (const part of parts.filter(Boolean).map(safeName)) {
     cursor = await cursor.getDirectoryHandle(part, { create: true });
@@ -315,6 +358,68 @@ async function backupAll() {
     return;
   }
 
+  if (isElectron && state.destination.path) {
+    const backupRoot = require("path").join(state.destination.path, "AlfombraBackup");
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+    let copied = 0;
+
+    for (const comparison of state.comparisons) {
+      const selected = [
+        ...(comparison.decisions.new ? comparison.newFiles : []),
+        ...(comparison.decisions.changed ? comparison.changedFiles : []),
+      ];
+
+      for (const item of selected) {
+        // in Electron mode item should have fullPath
+        const src = item.fullPath || item.previous?.fullPath;
+        if (!src) {
+          log(`No se pudo localizar el archivo de origen para ${item.path}`);
+          continue;
+        }
+        await window.kopiaApi.writeFile(backupRoot, item.path, src);
+        if (els.versioningToggle.checked && item.previous) {
+          await window.kopiaApi.writeFile(require("path").join(backupRoot, "_versions", stamp), item.path, src);
+        }
+        copied += 1;
+        state.copied = copied;
+        updateCounts();
+      }
+
+      const nextManifest = { ...comparison.previousManifest };
+      selected.forEach((item) => {
+        nextManifest[item.path] = comparison.manifest[item.path];
+      });
+      if (comparison.decisions.missing) {
+        comparison.missingFiles.forEach((item) => {
+          delete nextManifest[item.path];
+        });
+      }
+
+      const report = {
+        date: new Date().toISOString(),
+        source: comparison.sourceName,
+        copied: selected.length,
+        skippedNew: comparison.decisions.new ? 0 : comparison.newFiles.length,
+        skippedChanged: comparison.decisions.changed ? 0 : comparison.changedFiles.length,
+        missingRegistered: comparison.decisions.missing ? comparison.missingFiles : [],
+      };
+      // write log file in Electron: create a local .kopia-logs folder inside backupRoot/source
+      const logRoot = require("path").join(backupRoot, comparison.sourceName, "_logs");
+      const fs = require("fs").promises;
+      await fs.mkdir(logRoot, { recursive: true });
+      await fs.writeFile(require("path").join(logRoot, `${stamp}.json`), JSON.stringify(report, null, 2));
+
+      saveManifest(comparison.sourceName, nextManifest);
+      log(`${comparison.sourceName}: ${selected.length} archivos copiados y manifiesto actualizado.`);
+    }
+
+    state.copied = copied;
+    updateCounts();
+    log(`Copia finalizada: ${copied} archivos.`);
+    return;
+  }
+
+  // browser fallback (existing implementation)
   const backupRoot = await getOrCreateDirectory(state.destination.handle, ["AlfombraBackup"]);
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   let copied = 0;
